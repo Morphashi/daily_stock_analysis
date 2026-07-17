@@ -389,6 +389,11 @@ jobs:
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
+          # US free data proxy: daily volume ratio, estimated turnover, and volume profile.
+          # No Longbridge account is required. Set false to skip the extra Yahoo requests.
+          US_MARKET_MICROSTRUCTURE_ENABLED: ${{ vars.US_MARKET_MICROSTRUCTURE_ENABLED || 'true' }}
+          US_VOLUME_PROFILE_LOOKBACK_DAYS: ${{ vars.US_VOLUME_PROFILE_LOOKBACK_DAYS || '60' }}
+          US_CAPITAL_FLOW_GUARDRAIL: ${{ vars.US_CAPITAL_FLOW_GUARDRAIL || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位

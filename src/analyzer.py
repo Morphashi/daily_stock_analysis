@@ -13,6 +13,7 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -1039,7 +1040,25 @@ def stabilize_decision_with_structure(
 
         flow_bias, flow_reason = _capital_flow_bias_with_status(fundamental_context)
         if flow_bias == "unavailable":
-            if isinstance(fundamental_context, dict) and "capital_flow" in fundamental_context:
+            is_us_market = detect_market(str(getattr(result, "code", ""))) == "us"
+            # Yahoo Finance has no A-share-style main-force-flow feed. Keep
+            # its missing field from invalidating an otherwise actionable US
+            # buy call, while retaining all price-position risk checks below.
+            bypass_missing_us_flow = (
+                is_us_market
+                and os.getenv("US_CAPITAL_FLOW_GUARDRAIL", "false").strip().lower()
+                not in {"1", "true", "yes", "on"}
+            )
+            if bypass_missing_us_flow:
+                _set_decision_stability_unavailable(
+                    result,
+                    language,
+                    current_price=current_price,
+                    support=support,
+                    resistance=resistance,
+                    flow_status=flow_reason,
+                )
+            elif isinstance(fundamental_context, dict) and "capital_flow" in fundamental_context:
                 if decision_type == "buy" or advice_decision_type == "buy":
                     _downgrade_buy_without_capital_flow(
                         result,

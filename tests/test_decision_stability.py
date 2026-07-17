@@ -167,6 +167,27 @@ def test_downgrades_buy_when_capital_flow_is_unavailable() -> None:
     assert "未使用资金流校准" in sell_result.dashboard["decision_stability"]["reason"]
 
 
+def test_preserves_us_buy_when_capital_flow_is_unavailable_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("US_CAPITAL_FLOW_GUARDRAIL", raising=False)
+    result = _result(
+        decision_type="buy",
+        operation_advice="买入",
+        score=66,
+        current_price=32.0,
+    )
+    result.code = "MU"
+
+    stabilize_decision_with_structure(
+        result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        _unsupported_fund_flow(),
+    )
+
+    assert result.decision_type == "buy"
+    assert result.operation_advice == "买入"
+    assert result.dashboard["decision_stability"]["applied"] is False
+
+
 def test_downgrades_buy_when_capital_flow_values_are_na() -> None:
     result = _result(
         decision_type="buy",

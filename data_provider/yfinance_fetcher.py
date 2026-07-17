@@ -16,6 +16,7 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 
 import csv
 import logging
+import math
 from datetime import datetime
 from io import StringIO
 from typing import Optional, List, Dict, Any
@@ -32,7 +33,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
-from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
+from .realtime_types import ChipDistribution, UnifiedRealtimeQuote, RealtimeSource
 from .us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
 from src.services.market_symbol_utils import get_suffix_market, is_suffix_market_symbol
 
@@ -74,6 +75,119 @@ class YfinanceFetcher(BaseFetcher):
 
     name = "YfinanceFetcher"
     priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
+
+    @staticmethod
+    def _safe_positive_float(value: Any) -> Optional[float]:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) and numeric > 0 else None
+
+    @staticmethod
+    def _us_microstructure_enabled() -> bool:
+        return os.getenv("US_MARKET_MICROSTRUCTURE_ENABLED", "true").strip().lower() not in {
+            "0", "false", "no", "off"
+        }
+
+    def _get_us_quote_metrics(
+        self, ticker: Any, ticker_info: Dict[str, Any], current_volume: Any,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Return daily volume ratio and estimated turnover for a US stock."""
+        volume_ratio = None
+        turnover_rate = None
+        current = self._safe_positive_float(current_volume)
+        try:
+            history = ticker.history(period="10d", auto_adjust=False)
+            if history is not None and not history.empty and "Volume" in history:
+                volumes = pd.to_numeric(history["Volume"], errors="coerce").dropna()
+                if len(volumes) >= 6:
+                    latest_volume = self._safe_positive_float(volumes.iloc[-1]) or current
+                    baseline = self._safe_positive_float(volumes.iloc[-6:-1].mean())
+                    if latest_volume is not None and baseline is not None:
+                        volume_ratio = round(latest_volume / baseline, 2)
+                        current = latest_volume
+        except Exception as exc:
+            logger.debug("[Yfinance] US volume-ratio history unavailable: %s", exc)
+
+        float_shares = self._safe_positive_float(ticker_info.get("floatShares"))
+        if float_shares is None:
+            float_shares = self._safe_positive_float(ticker_info.get("sharesOutstanding"))
+        if current is not None and float_shares is not None:
+            turnover_rate = round(current / float_shares * 100.0, 4)
+        return volume_ratio, turnover_rate
+
+    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
+        """Build a volume-profile estimate, not broker-level holder-cost data."""
+        if not self._is_us_stock(stock_code) or not self._us_microstructure_enabled():
+            return None
+        try:
+            import yfinance as yf
+
+            lookback = min(120, max(20, int(os.getenv("US_VOLUME_PROFILE_LOOKBACK_DAYS", "60"))))
+            ticker = yf.Ticker(self._convert_stock_code(stock_code))
+            history = ticker.history(
+                period=f"{max(90, int(lookback * 1.8))}d", auto_adjust=False
+            )
+            required = {"High", "Low", "Close", "Volume"}
+            if history is None or history.empty or not required.issubset(history.columns):
+                return None
+
+            history = history.tail(lookback).copy()
+            price = (
+                pd.to_numeric(history["High"], errors="coerce")
+                + pd.to_numeric(history["Low"], errors="coerce")
+                + pd.to_numeric(history["Close"], errors="coerce")
+            ) / 3.0
+            volume = pd.to_numeric(history["Volume"], errors="coerce")
+            profile = pd.DataFrame({"price": price, "volume": volume}).dropna()
+            profile = profile[(profile["price"] > 0) & (profile["volume"] > 0)]
+            if len(profile) < 20:
+                return None
+
+            total_volume = float(profile["volume"].sum())
+            average_cost = float((profile["price"] * profile["volume"]).sum() / total_volume)
+            if float(profile["price"].max()) <= float(profile["price"].min()) or average_cost <= 0:
+                return None
+
+            bin_count = min(32, max(12, int(math.sqrt(len(profile)) * 3)))
+            bins = pd.cut(profile["price"], bins=bin_count, include_lowest=True)
+            grouped = profile.groupby(bins, observed=False).agg(
+                volume=("volume", "sum"), price=("price", "mean")
+            ).dropna()
+            grouped = grouped[grouped["volume"] > 0].sort_values("price")
+            if grouped.empty:
+                return None
+            grouped["cum_weight"] = grouped["volume"].cumsum() / float(grouped["volume"].sum())
+
+            def weighted_price_at(percentile: float) -> float:
+                return float(grouped.loc[grouped["cum_weight"] >= percentile, "price"].iloc[0])
+
+            cost_90_low, cost_90_high = weighted_price_at(0.05), weighted_price_at(0.95)
+            cost_70_low, cost_70_high = weighted_price_at(0.15), weighted_price_at(0.85)
+            current_price = float(profile["price"].iloc[-1])
+            profit_ratio = float(
+                profile.loc[profile["price"] <= current_price, "volume"].sum() / total_volume
+            )
+            date_value = history.index[-1]
+            date_text = str(getattr(date_value, "date", lambda: date_value)())
+
+            return ChipDistribution(
+                code=stock_code.strip().upper(),
+                date=date_text,
+                source="yfinance_volume_profile_estimate",
+                profit_ratio=round(profit_ratio, 4),
+                avg_cost=round(average_cost, 4),
+                cost_90_low=round(cost_90_low, 4),
+                cost_90_high=round(cost_90_high, 4),
+                concentration_90=round((cost_90_high - cost_90_low) / average_cost, 4),
+                cost_70_low=round(cost_70_low, 4),
+                cost_70_high=round(cost_70_high, 4),
+                concentration_70=round((cost_70_high - cost_70_low) / average_cost, 4),
+            )
+        except Exception as exc:
+            logger.debug("[Yfinance] US volume-profile unavailable for %s: %s", stock_code, exc)
+            return None
 
     def __init__(self):
         """初始化 YfinanceFetcher"""
@@ -874,6 +988,11 @@ class YfinanceFetcher(BaseFetcher):
                 ticker_info = ticker.info or {}
             except Exception:
                 ticker_info = {}
+            volume_ratio = turnover_rate = None
+            if is_us_symbol and self._us_microstructure_enabled():
+                volume_ratio, turnover_rate = self._get_us_quote_metrics(
+                    ticker, ticker_info, volume
+                )
             try:
                 info_name = ticker_info.get('shortName', '') or ticker_info.get('longName', '') or ''
                 name = info_name if is_meaningful_stock_name(info_name, symbol) else STOCK_NAME_MAP.get(symbol, '')
@@ -905,8 +1024,8 @@ class YfinanceFetcher(BaseFetcher):
                 change_amount=round(change_amount, 4) if change_amount is not None else None,
                 volume=volume,
                 amount=None,  # yfinance 不直接提供成交额
-                volume_ratio=None,
-                turnover_rate=None,
+                volume_ratio=volume_ratio,
+                turnover_rate=turnover_rate,
                 amplitude=round(amplitude, 2) if amplitude is not None else None,
                 open_price=open_price,
                 high=high,
